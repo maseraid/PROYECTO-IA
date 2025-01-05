@@ -1,584 +1,679 @@
-import flet as ft
-import threading
-import time
+import os
 import sys
+import time
+import threading
+import mysql.connector
+from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
 
+# ======================== Clase Database ========================
+class Database:
+    def __init__(self):
+        load_dotenv()  # Carga variables de entorno desde .env
+        self.host = os.getenv("DB_HOST", "localhost")
+        self.user = os.getenv("DB_USER", "root")
+        self.password = os.getenv("DB_PASSWORD", "")
+        self.database = os.getenv("DB_NAME", "")
 
-class ChatApp:
-    def __init__(self, page: ft.Page):
-        self.page = page
-        self.page.title = "Chatbot con Flet"
-        self.page.horizontal_alignment = ft.CrossAxisAlignment.START
-        self.page.vertical_alignment = ft.MainAxisAlignment.START
-
-        # Lista para mantener el orden de creación de los chats
-        self.chat_order = []  # Mantiene el orden de los chats
-        self.chats = {}  # {chat_id: [(mensaje, is_user)]}
-        self.active_chat = None  # Chat actualmente seleccionado
-        self.chat_counter = 0  # Contador para generar identificadores únicos
-
-        # Para manejar threads de respuestas del bot
-        self.bot_thread = None
-        self.cancel_bot_response = threading.Event()
-
-        # Componentes dinámicos
-        self.chat_list = ft.Column(scroll="auto", expand=True)  # Lista de chats
-        self.messages_container = ft.Column(scroll="auto", expand=True)  # Mensajes
-        self.typing_indicator = ft.Text(
-            "El bot está escribiendo...", visible=False, size=14, italic=True
-        )
-        self.options_button = ft.IconButton(  # Inicializar el botón de opciones
-            icon=ft.Icons.MORE_VERT,
-            on_click=self.show_chat_options,
-            tooltip="Opciones del chat",
-            visible=False,
-        )
-        #self.chat_title = ft.Text("Chatbot", size=20, weight="bold")  # Título dinámico del chat
-        #ft.Text("Bienvenido a MINDCARE mateo", size=24, color=ft.Colors.GREY),
-        self.chat_title = ft.Text("Chat", size=18, color=ft.Colors.GREY)  # Título dinámico del chat
-    
-        # Entrada de mensajes
-        self.user_input = ft.TextField(
-            hint_text="Escribe tu mensaje...",
-            expand=True,
-            disabled=True,
-            on_submit=self.send_message,
-        )
-        self.send_button = ft.ElevatedButton(
-            "Enviar", on_click=self.send_message, disabled=True
-        )
-
-    def build_ui(self):
-        """
-        Construye la interfaz gráfica principal.
-        """
-        self.page.add(
-            ft.Row(
-                controls=[
-                    # Panel izquierdo: lista de chats y configuración
-                    ft.Container(
-                        content=ft.Column(
-                            [
-                                ft.Row(
-                                    controls=[
-                                        ft.Text("Chats", size=18, weight="bold"),
-                                        ft.IconButton(
-                                            icon=ft.Icons.ADD,
-                                            on_click=self.add_chat,
-                                            tooltip="Agregar chat",
-                                        ),
-                                    ],
-                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                                ),
-                                self.chat_list,
-                                ft.Divider(),
-                                ft.IconButton(
-                                    icon=ft.Icons.SETTINGS,
-                                    on_click=self.show_settings_menu,
-                                    tooltip="Configuración",
-                                ),
-                            ],
-                            expand=True,
-                        ),
-                        width=200,
-                        padding=10,
-                        bgcolor="#EEEEEE",
-                    ),
-                    # Panel derecho: área de mensajes
-                    ft.Column(
-                        controls=[
-                            ft.Text("Bienvenido a MINDCARE mateo", size=18, weight="bold"),
-                            ft.Row(
-                                controls=[
-                                    self.chat_title,
-                                    self.options_button,
-                                ],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            ),
-                            ft.Divider(),
-                            ft.Container(
-                                content=self.messages_container, expand=True
-                            ),
-                            self.typing_indicator,
-                            ft.Row(
-                                [self.user_input, self.send_button],
-                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                            ),
-                        ],
-                        expand=True,
-                    ),
-                ],
-                expand=True,
+    def get_connection(self):
+        """Crea y retorna una conexión a MySQL."""
+        try:
+            conn = mysql.connector.connect(
+                host=self.host,
+                user=self.user,
+                password=self.password,
+                database=self.database
             )
+            return conn
+        except mysql.connector.Error as err:
+            print(f"Error al conectar a la base de datos: {err}")
+            return None
+
+# ======================== Clase AuthService ========================
+class AuthService:
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def delete_user_account(self, user_id: int) -> bool:
+        """Elimina la cuenta del usuario junto con sus sesiones y mensajes."""
+        conn = self.db.get_connection()
+        if not conn:
+            return False
+        try:
+            cursor = conn.cursor()
+            # Eliminar los mensajes asociados a las sesiones del usuario
+            cursor.execute("DELETE FROM messages WHERE session_id IN (SELECT id FROM chat_sessions WHERE user_id = %s)", (user_id,))
+            # Eliminar las sesiones del usuario
+            cursor.execute("DELETE FROM chat_sessions WHERE user_id = %s", (user_id,))
+            # Eliminar la cuenta del usuario
+            cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+            conn.commit()
+            print("Cuenta eliminada exitosamente.")
+            return True
+        except mysql.connector.Error as err:
+            print(f"Error al eliminar la cuenta: {err}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def register_user(self, username: str, password: str) -> bool:
+        """Registra un nuevo usuario. Retorna True si se registró con éxito."""
+        conn = self.db.get_connection()
+        if not conn:
+            return False
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
+            if cursor.fetchone():
+                print("El usuario ya existe.")
+                return False
+            cursor.execute(
+                "INSERT INTO users (username, password) VALUES (%s, %s)",
+                (username, password)
+            )
+            conn.commit()
+            print("Usuario registrado con éxito.")
+            return True
+        except mysql.connector.Error as err:
+            print(f"Error en register_user: {err}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def login_user(self, username: str, password: str) -> int:
+        """Verifica usuario y contraseña. Retorna el 'id' del usuario si es correcto."""
+        conn = self.db.get_connection()
+        if not conn:
+            return 0
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, password FROM users WHERE username = %s", (username,))
+            row = cursor.fetchone()
+            if row:
+                user_id, stored_password = row
+                if stored_password == password:
+                    print("¡Login exitoso!")
+                    return user_id
+            print("Usuario o contraseña incorrectos.")
+            return 0
+        except mysql.connector.Error as err:
+            print(f"Error en login_user: {err}")
+            return 0
+        finally:
+            cursor.close()
+            conn.close()
+
+# ======================== Clase ChatService ========================
+class ChatService:
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def delete_all_user_chats(self, user_id: int) -> bool:
+        """Elimina todas las sesiones de chat y sus mensajes asociados para un usuario."""
+        conn = self.db.get_connection()
+        if not conn:
+            return False
+        try:
+            cursor = conn.cursor()
+            # Eliminar los mensajes asociados a las sesiones del usuario
+            cursor.execute("DELETE FROM messages WHERE session_id IN (SELECT id FROM chat_sessions WHERE user_id = %s)", (user_id,))
+            # Eliminar las sesiones del usuario
+            cursor.execute("DELETE FROM chat_sessions WHERE user_id = %s", (user_id,))
+            conn.commit()
+            print("Todos los chats han sido eliminados exitosamente.")
+            return True
+        except mysql.connector.Error as err:
+            print(f"Error al eliminar todos los chats: {err}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def rename_chat_session(self, session_id: int, new_name: str) -> bool:
+        """Renombra una sesión de chat dado su ID."""
+        conn = self.db.get_connection()
+        if not conn:
+            return False
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE chat_sessions SET session_name = %s WHERE id = %s",
+                (new_name, session_id)
+            )
+            conn.commit()
+            print("Sesión renombrada exitosamente.")
+            return True
+        except mysql.connector.Error as err:
+            print(f"Error al renombrar la sesión: {err}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+    def delete_chat_session(self, session_id: int) -> bool:
+        """Elimina una sesión de chat y sus mensajes asociados."""
+        conn = self.db.get_connection()
+        if not conn:
+            return False
+        try:
+            cursor = conn.cursor()
+            # Primero eliminar los mensajes asociados
+            cursor.execute("DELETE FROM messages WHERE session_id = %s", (session_id,))
+            # Luego eliminar la sesión
+            cursor.execute("DELETE FROM chat_sessions WHERE id = %s", (session_id,))
+            conn.commit()
+            print("Sesión eliminada exitosamente.")
+            return True
+        except mysql.connector.Error as err:
+            print(f"Error al eliminar la sesión: {err}")
+            return False
+        finally:
+            cursor.close()
+            conn.close()
+
+    def create_chat_session(self, user_id: int, session_name: str = "Sesión de Chat") -> int:
+        """Crea una nueva sesión de chat para el usuario y retorna su ID."""
+        conn = self.db.get_connection()
+        if not conn:
+            return 0
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO chat_sessions (user_id, session_name)
+                VALUES (%s, %s)
+                """,
+                (user_id, session_name)
+            )
+            conn.commit()
+            return cursor.lastrowid
+        except mysql.connector.Error as err:
+            print(f"Error al crear la sesión: {err}")
+            return 0
+        finally:
+            cursor.close()
+            conn.close()
+
+    def get_user_sessions(self, user_id: int) -> list:
+        """Retorna una lista de (session_id, session_name) de las sesiones del usuario, ordenadas por fecha de creación descendente."""
+        conn = self.db.get_connection()
+        if not conn:
+            return []
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, session_name 
+                FROM chat_sessions 
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                """,
+                (user_id,)
+            )
+            return cursor.fetchall()
+        except mysql.connector.Error as err:
+            print(f"Error al obtener sesiones: {err}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
+
+    def save_message(self, session_id: int, role: str, message: str) -> None:
+        """Guarda un mensaje en la tabla 'messages'."""
+        conn = self.db.get_connection()
+        if not conn:
+            return
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO messages (session_id, role, message) 
+                VALUES (%s, %s, %s)
+                """,
+                (session_id, role, message)
+            )
+            conn.commit()
+        except mysql.connector.Error as err:
+            print(f"Error al guardar el mensaje: {err}")
+        finally:
+            cursor.close()
+            conn.close()
+
+    def load_messages(self, session_id: int) -> list:
+        """Retorna los mensajes de la sesión en forma de lista de tuplas (role, message)."""
+        conn = self.db.get_connection()
+        if not conn:
+            return []
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT role, message 
+                FROM messages 
+                WHERE session_id = %s 
+                ORDER BY created_at ASC
+                """,
+                (session_id,)
+            )
+            return cursor.fetchall()
+        except mysql.connector.Error as err:
+            print(f"Error al cargar mensajes: {err}")
+            return []
+        finally:
+            cursor.close()
+            conn.close()
+
+# ======================== Clase ChatModel ========================
+class ChatModel:
+    def __init__(self):
+        self.api_token = os.getenv('HUGGINGFACEHUB_API_TOKEN')
+        if not self.api_token:
+            raise ValueError("El token de Hugging Face no está configurado. Agrega tu token en un archivo .env.")
+
+        self.client = InferenceClient(
+            model="meta-llama/Llama-2-7b-chat-hf",
+            token=self.api_token
         )
-        self.show_welcome_message()
 
-    # -------------------------------------------------------------------------
-    # Configuración
-    # -------------------------------------------------------------------------
-    def show_settings_menu(self, e):
-        """
-        Muestra las opciones del menú de configuración.
-        """
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Configuración"),
-            content=ft.Column(
-                controls=[
-                    ft.TextButton(
-                        text="Cerrar sesión",
-                        on_click=self.confirm_logout,
-                    ),
-                    ft.TextButton(
-                        text="Eliminar cuenta",
-                        on_click=self.confirm_delete_account,
-                    ),
-                    ft.TextButton(
-                        text="Eliminar todos los chats",
-                        on_click=self.confirm_delete_all_chats,
-                    ),
-                    ft.TextButton(
-                        text="Info.",
-                        on_click=self.show_info,
-                    ),
-                ],
-            ),
-            actions=[
-                ft.TextButton("Cerrar", on_click=lambda e: self.close_dialog()),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
+    def generar_respuesta_dinamica(self, contexto, entrada_usuario):
+        # Añadir instrucciones dinámicas al modelo basadas en la entrada del usuario
+        if "triste" in entrada_usuario.lower() or "deprimido" in entrada_usuario.lower():
+            contexto += " Por favor, ofrece consejos prácticos y reconfortantes para alguien que se siente triste. Ayuda al usuario a encontrar formas de sentirse mejor."
+        elif "superar" in entrada_usuario.lower() or "ayuda" in entrada_usuario.lower():
+            contexto += " Brinda pasos claros y consejos específicos sobre cómo superar una situación difícil o emocional."
+        elif "solo" in entrada_usuario.lower():
+            contexto += " Responde con empatía y sugiere formas de conectarse con los demás o mejorar el estado emocional."
+        else:
+            contexto += " Responde de forma empática y adaptada al contexto del usuario."
+        contexto += " Responde exclusivamente en español, sin incluir texto en otros idiomas."
+        return contexto
 
-    def confirm_logout(self, e):
-        """
-        Muestra una ventana de confirmación para cerrar sesión.
-        """
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Cerrar sesión"),
-            content=ft.Text("¿Estás seguro de que deseas cerrar sesión?"),
-            actions=[
-                ft.TextButton("Cancelar", on_click=lambda e: self.close_dialog()),
-                ft.TextButton("Cerrar sesión", on_click=lambda e: self.exit_app()),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
+    def verificar_respuesta_completa(self, respuesta):
+        # Validar si la respuesta está incompleta y solicitar continuación si es necesario
+        if respuesta.endswith("...") or len(respuesta.split()) < 15:
+            return True
+        return False
 
-    def confirm_delete_account(self, e):
-        """
-        Muestra una ventana para confirmar la eliminación de la cuenta.
-        """
-        input_field = ft.TextField(label="Escribe 'ELIMINAR' para confirmar")
+    def generate_response(self, contexto_actualizado, contexto_dinamico):
+        try:
+            # Realiza la animación mientras espera la respuesta
+            stop_event = threading.Event()
+            hilo_animacion = threading.Thread(target=self.animacion_respuesta, args=(stop_event,))
+            hilo_animacion.start()
 
-        def on_confirm(e):
-            if input_field.value.strip().upper() == "ELIMINAR":
-                self.exit_app()
+            # Obtener la respuesta de la API
+            respuesta = self.client.text_generation(contexto_actualizado + contexto_dinamico, max_new_tokens=400)
+
+            # Validar si la respuesta está incompleta
+            if self.verificar_respuesta_completa(respuesta):
+                respuesta += self.client.text_generation("Continúa: " + respuesta, max_new_tokens=150)
+
+            # Detener la animación y limpiar
+            stop_event.set()
+            hilo_animacion.join()
+            sys.stdout.write("" + " " * 30 + "")
+
+            # Filtrar la respuesta para eliminar posibles entradas generadas del usuario
+            respuesta_filtrada = respuesta.split("Usuario:")[0].strip()
+            return respuesta_filtrada
+        except Exception as e:
+            print(f"Error al consultar el modelo: {e}")
+            return "Lo siento, hubo un error al procesar tu solicitud."
+
+    def animacion_respuesta(self, stop_event):
+        """Simula una animación de escritura mientras no se detenga."""
+        animacion = "|/-\\"
+        while not stop_event.is_set():
+            for frame in animacion:
+                if stop_event.is_set():
+                    break
+                sys.stdout.write(f"El chatbot está respondiendo {frame}")
+                sys.stdout.flush()
+                time.sleep(0.2)
+
+    def generate_response(self, prompt: str, max_new_tokens: int = 300) -> str:
+        try:
+            response = self.client.text_generation(prompt, max_new_tokens=max_new_tokens)
+            return response
+        except Exception as e:
+            print(f"Error al generar respuesta: {e}")
+            return "Lo siento, hubo un error al procesar tu solicitud."
+
+# ======================== Clase ChatApplication ========================
+class ChatApplication:
+    def __init__(self):
+        self.db = Database()
+        self.auth_service = AuthService(self.db)
+        self.chat_service = ChatService(self.db)
+        self.chat_model = ChatModel()
+
+    def start(self):
+        print("\n=== Bienvenido a la aplicación de chat ===\n")
+        user_id = self._handle_auth_flow()
+        if not user_id:
+            print("No se pudo iniciar sesión. Saliendo del programa.")
+            return
+
+        session_id = self._select_or_create_chat_session(user_id)
+        if not session_id:
+            print("No se pudo crear/seleccionar la sesión. Saliendo del programa.")
+            return
+
+        print(f"\nSesión seleccionada con ID={session_id}\n")
+        historial = self._build_historial(session_id)
+        print("Historial de la sesión:")
+        for mensaje in historial:
+            print(mensaje)
+        print("¡Listo! Escribe 'salir' para terminar la sesión.\n")
+
+        while True:
+            entrada_usuario = input("Tú: ").strip()
+            if entrada_usuario.lower() == "salir":
+                print("\nSesión finalizada. ¡Hasta pronto!\n")
+                break
+
+            self.chat_service.save_message(session_id, "USER", entrada_usuario)
+            historial.append(f"Usuario: {entrada_usuario}")
+            prompt = self._construct_prompt(historial)
+
+            stop_event = threading.Event()
+            hilo = threading.Thread(target=self._animacion_respuesta, args=(stop_event,))
+            hilo.start()
+
+            respuesta_completa = self.chat_model.generate_response(prompt)
+            respuesta = respuesta_completa.split('Usuario:')[0].strip()
+
+            stop_event.set()
+            hilo.join()
+            sys.stdout.write("\r" + " " * 60 + "\r")
+
+            print(f"IA: {respuesta}\n")
+            self.chat_service.save_message(session_id, "ASSISTANT", respuesta)
+            historial.append(f"IA: {respuesta}")
+
+    def _handle_auth_flow(self) -> int:
+        while True:
+            opcion = input("¿Deseas [1] Iniciar sesión, [2] Registrarte? (1/2): ").strip()
+            if opcion == "1": 
+                username = input("Nombre de usuario: ").strip()
+                password = input("Contraseña: ").strip()
+                user_id = self.auth_service.login_user(username, password)
+                if user_id:
+                    return user_id
+            elif opcion == "2":
+                username = input("Elige un nombre de usuario: ").strip()
+                password = input("Elige una contraseña: ").strip()
+                if self.auth_service.register_user(username, password):
+                    user_id = self.auth_service.login_user(username, password)
+                    if user_id:
+                        return user_id
             else:
-                input_field.error_text = "Palabra incorrecta, intenta nuevamente."
-                input_field.update()
+                print("Opción inválida. Intenta de nuevo.")
+           
+    def _select_or_create_chat_session(self, user_id: int) -> int:
+        sesiones = self.chat_service.get_user_sessions(user_id)
+        if sesiones:
+            print("Sesiones existentes:")
+            for idx, (sid, sname) in enumerate(sesiones, start=1):
+                print(f"{idx}. {sname} (ID: {sid})")
+            print(f"{len(sesiones)+1}. Crear nueva sesión")
+            print(f"{len(sesiones)+2}. Renombrar una sesión")
+            print(f"{len(sesiones)+3}. Eliminar una sesión")
+            print(f"{len(sesiones)+4}. Eliminar mi cuenta")
+            print(f"{len(sesiones)+5}. Eliminar todos los chats")
 
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Eliminar cuenta"),
-            content=input_field,
-            actions=[
-                ft.TextButton("Cancelar", on_click=lambda e: self.close_dialog()),
-                ft.TextButton("Eliminar cuenta", on_click=on_confirm),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
+            seleccion = input("Elige una opción: ").strip()
+            try:
+                seleccion = int(seleccion)
+                if 1 <= seleccion <= len(sesiones):
+                    return sesiones[seleccion-1][0]
+                elif seleccion == len(sesiones) + 1:
+                    sname = input("Nombre para la nueva sesión: ").strip()
+                    return self.chat_service.create_chat_session(user_id, sname or "Sesión Nueva")
+                elif seleccion == len(sesiones) + 2:
+                    self._rename_chat_session(user_id)
+                    return 0
+                elif seleccion == len(sesiones) + 3:
+                    self._delete_chat_session(user_id)
+                    return 0
+                elif seleccion == len(sesiones) + 4:
+                    self._delete_user_account(user_id)
+                    return 0
+                elif seleccion == len(sesiones) + 5:
+                    self._delete_all_user_chats(user_id)
+                    return 0
+                else:
+                    print("Opción inválida. Volviendo al menú principal.")
+                    return 0
+            except ValueError:
+                print("Opción inválida. Volviendo al menú principal.")
+                return 0
+        else:
+            print("No tienes sesiones. Creando la primera sesión automáticamente.")
+            return self.chat_service.create_chat_session(user_id, "Sesión Inicial")
 
-    def confirm_delete_all_chats(self, e):
-        """
-        Muestra una ventana para confirmar la eliminación de todos los chats.
-        """
-        input_field = ft.TextField(label="Escribe 'ELIMINAR' para confirmar")
-
-        def on_confirm(e):
-            if input_field.value.strip().upper() == "ELIMINAR":
-                self.chat_counter = 0 #Reiniciar el contador de chats
-                self.chat_title.value = "Chat"
-                self.options_button.visible = False  
-                self.chat_order.clear()
-                self.chats.clear()
-                self.active_chat = None
-                self.update_chat_list()
-                self.load_messages()
-                self.close_dialog()
+    def _delete_all_user_chats(self, user_id: int):
+        confirmacion = input("Si estás seguro de eliminar todos tus chats escribe: ELIMINAR").strip()
+        if confirmacion == "ELIMINAR":
+            if self.chat_service.delete_all_user_chats(user_id):
+                print("Todos tus chats han sido eliminados correctamente.")
             else:
-                input_field.error_text = "Palabra incorrecta, intenta nuevamente."
-                input_field.update()
+                print("Hubo un problema al eliminar tus chats. Por favor, inténtalo nuevamente.")
+        else:
+            print("Eliminación de chats cancelada. Volviendo al menú principal.")
+        sesiones = self.chat_service.get_user_sessions(user_id)
+        if sesiones:
+            print("Sesiones existentes:")
+            for idx, (sid, sname) in enumerate(sesiones, start=1):
+                print(f"{idx}. {sname} (ID: {sid})")
+            print(f"{len(sesiones)+1}. Crear nueva sesión")
+            print(f"{len(sesiones)+2}. Renombrar una sesión")
+            print(f"{len(sesiones)+3}. Eliminar una sesión")
+            print(f"{len(sesiones)+4}. Eliminar mi cuenta")
 
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Eliminar todos los chats"),
-            content=input_field,
-            actions=[
-                ft.TextButton("Cancelar", on_click=lambda e: self.close_dialog()),
-                ft.TextButton("Eliminar todos los chats", on_click=on_confirm),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
+            seleccion = input("Elige una opción: ").strip()
+            try:
+                seleccion = int(seleccion)
+                if 1 <= seleccion <= len(sesiones):
+                    return sesiones[seleccion-1][0]
+                elif seleccion == len(sesiones) + 1:
+                    sname = input("Nombre para la nueva sesión: ").strip()
+                    return self.chat_service.create_chat_session(user_id, sname or "Sesión Nueva")
+                elif seleccion == len(sesiones) + 2:
+                    self._rename_chat_session(user_id)
+                    return 0
+                elif seleccion == len(sesiones) + 3:
+                    self._delete_chat_session(user_id)
+                    return 0
+                elif seleccion == len(sesiones) + 4:
+                    self._delete_user_account(user_id)
+                    return 0
+                else:
+                    print("Opción inválida. Volviendo al menú principal.")
+                    return 0
+            except ValueError:
+                print("Opción inválida. Volviendo al menú principal.")
+                return 0
+        else:
+            print("No tienes sesiones. Creando la primera sesión automáticamente.")
+            return self.chat_service.create_chat_session(user_id, "Sesión Inicial")
 
-    def show_info(self, e):
-        """
-        Muestra información del programa.
-        """
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Info"),
-            content=ft.ListView(
-                #controls=[ft.Text(f"Creadro: dfnsdifhdifuhsfiushfdsufhsufhdsuyfsdfuysgfdsufygsefuysgfuydgfsugdsdsfuygfsdgudfuygdsfuysdgsdfsfs")],
-                controls=[ft.Text(f"Creadro: dfnsdifhdifuhsfiushfdsufhsufhdsuyfsdfuysgfdsufygseffhfhfhfghfhgfhghgfhghghfghfhfghfghfghfhfghfghfghfghfuysgfuydgfsugdsdsfuygfsdgudfuygdsfuysdgsdfsfs", size=16), 
-                          ft.Text(f"Mateo ramos", size=16),
-                          ft.Text(f"Mateo ramos", size=16),
-                          ft.Text(f"Mateo ramos", size=16),
-                          ft.Text(f"Mateo ramos", size=16)],
-                height=100,  # Altura fija que permite el scroll si es necesario
-                width=300,
-            ),
-            actions=[
-                ft.TextButton("Cerrar", on_click=lambda e: self.close_dialog()),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
-    
-    def exit_app(self):
-        """
-        Cierra el programa.
-        """
-        self.page.window_close()  # Cierra la ventana de la aplicación
-        sys.exit(0)
+    def _delete_user_account(self, user_id: int):
+        confirmacion = input("Si estás seguro de eliminar tu cuenta escribe: ELIMINAR").strip()
+        if confirmacion == "ELIMINAR":
+            if self.auth_service.delete_user_account(user_id):
+                print("Tu cuenta ha sido eliminada correctamente. Cerrando sesión...")
+                sys.exit()  # Finaliza el programa tras eliminar la cuenta
+            else:
+                print("Hubo un problema al eliminar tu cuenta. Por favor, inténtalo nuevamente.")
+        else:
+            print("Eliminación cancelada. Volviendo al menú principal.")
+        sesiones = self.chat_service.get_user_sessions(user_id)
+        if sesiones:
+            print("Sesiones existentes:")
+            for idx, (sid, sname) in enumerate(sesiones, start=1):
+                print(f"{idx}. {sname} (ID: {sid})")
+            print(f"{len(sesiones)+1}. Crear nueva sesión")
+            print(f"{len(sesiones)+2}. Renombrar una sesión")
+            print(f"{len(sesiones)+3}. Eliminar una sesión")
 
-    def close_dialog(self):
-        """
-        Cierra cualquier cuadro de diálogo activo.
-        """
-        if self.page.dialog:
-            self.page.dialog.open = False
-            self.page.update()
+            seleccion = input("Elige una opción: ").strip()
+            try:
+                seleccion = int(seleccion)
+                if 1 <= seleccion <= len(sesiones):
+                    return sesiones[seleccion-1][0]
+                elif seleccion == len(sesiones) + 1:
+                    sname = input("Nombre para la nueva sesión: ").strip()
+                    return self.chat_service.create_chat_session(user_id, sname or "Sesión Nueva")
+                elif seleccion == len(sesiones) + 2:
+                    self._rename_chat_session(user_id)
+                    return 0
+                elif seleccion == len(sesiones) + 3:
+                    self._delete_chat_session(user_id)
+                    return 0
+                else:
+                    print("Opción inválida. Volviendo al menú principal.")
+                    return 0
+            except ValueError:
+                print("Opción inválida. Volviendo al menú principal.")
+                return 0
+        else:
+            print("No tienes sesiones. Creando la primera sesión automáticamente.")
+            return self.chat_service.create_chat_session(user_id, "Sesión Inicial")
 
-    def show_chat_options(self, e):
-        """
-        Muestra el menú emergente con opciones del chat activo.
-        """
-        if not self.active_chat:
+    def _rename_chat_session(self, user_id: int):
+        sesiones = self.chat_service.get_user_sessions(user_id)
+        if not sesiones:
+            print("No hay sesiones para renombrar.")
             return
 
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Opciones del chat"),
-            content=ft.Column(
-                controls=[
-                    ft.TextButton(
-                        text="Ver nombre completo",
-                        on_click=lambda e: self.show_full_name_dialog(self.active_chat),
-                    ),
-                    ft.TextButton(
-                        text="Renombrar",
-                        on_click=lambda e: self.rename_chat_dialog(self.active_chat),
-                    ),
-                    ft.TextButton(
-                        text="Eliminar",
-                        on_click=lambda e: self.delete_chat_dialog(self.active_chat),
-                    ),
-                ],
-            ),
-            actions=[
-                ft.TextButton("Cerrar", on_click=lambda e: self.close_dialog()),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
+        print("Sesiones disponibles para renombrar:")
+        for idx, (sid, sname) in enumerate(sesiones, start=1):
+            print(f"{idx}. {sname} (ID: {sid})")
 
-    # -------------------------------------------------------------------------
-    # Manejo de Chats
-    # -------------------------------------------------------------------------
+        seleccion = input("Elige una sesión para renombrar: ").strip()
+        try:
+            seleccion = int(seleccion)
+            if 1 <= seleccion <= len(sesiones):
+                session_id = sesiones[seleccion-1][0]
+                new_name = input("Nuevo nombre para la sesión: ").strip()
+                if self.chat_service.rename_chat_session(session_id, new_name):
+                    print("Sesión renombrada correctamente.")
+                else:
+                    print("No se pudo renombrar la sesión.")
+            else:
+                print("Opción inválida.")
+        except ValueError:
+            print("Opción inválida.")
+        sesiones = self.chat_service.get_user_sessions(user_id)
+        if sesiones:
+            print("Sesiones existentes:")
+            for idx, (sid, sname) in enumerate(sesiones, start=1):
+                print(f"{idx}. {sname} (ID: {sid})")
+            print(f"{len(sesiones)+1}. Crear nueva sesión")
+            print(f"{len(sesiones)+2}. Eliminar una sesión")
 
-    def add_chat(self, e):
-        """
-        Crea un nuevo chat y lo establece como activo.
-        """
-        self.chat_counter += 1
-        chat_id = f"Chat {self.chat_counter}"
-        self.chats[chat_id] = []  # Inicializa la lista de mensajes del chat
-        self.chat_order.insert(0, chat_id)  # Agregar al inicio de la lista de orden
-        self.switch_chat(chat_id)  # Cambia automáticamente al nuevo chat
-        self.update_chat_list()
+            seleccion = input("Elige una opción: ").strip()
+            try:
+                seleccion = int(seleccion)
+                if 1 <= seleccion <= len(sesiones):
+                    return sesiones[seleccion-1][0]
+                elif seleccion == len(sesiones) + 1:
+                    sname = input("Nombre para la nueva sesión: ").strip()
+                    return self.chat_service.create_chat_session(user_id, sname or "Sesión Nueva")
+                elif seleccion == len(sesiones) + 2:
+                    self._delete_chat_session(user_id)
+                    return 0
+                else:
+                    print("Opción inválida. Volviendo al menú principal.")
+                    return 0
+            except ValueError:
+                print("Opción inválida. Volviendo al menú principal.")
+                return 0
+        else:
+            print("No tienes sesiones. Creando la primera sesión automáticamente.")
+            return self.chat_service.create_chat_session(user_id, "Sesión Inicial")
 
-    def switch_chat(self, chat_id):
-        """
-        Cambia el chat activo.
-        """
-        if chat_id == self.active_chat:
-            return  # Si ya está en el chat seleccionado, no hacer nada
-
-        # Cancelar la respuesta del bot si está en proceso
-        if self.bot_thread and self.bot_thread.is_alive():
-            self.cancel_bot_response.set()
-            self.bot_thread.join()  # Esperar a que termine el thread
-
-        # Limpiar la bandera para futuras respuestas
-        self.cancel_bot_response.clear()
-
-        # Cambiar de chat
-        self.active_chat = chat_id
-        self.chat_title.value = chat_id if len(chat_id) <= 15 else f"{chat_id[:12]}..." # Actualizar el título del chat con truncamiento.
-        self.options_button.visible = True  # Mostrar el botón de opciones del chat
-        self.update_chat_list()
-        self.load_messages()
-
-    def update_chat_list(self):
-        """
-        Actualiza la lista de chats en el panel izquierdo.
-        """
-        self.chat_list.controls.clear()
-        for chat_id in self.chat_order:
-            is_active = chat_id == self.active_chat
-
-            # Truncar nombres largos con puntos suspensivos
-            truncated_name = chat_id if len(chat_id) <= 15 else f"{chat_id[:12]}..."
-            
-            # Botón del chat
-            self.chat_list.controls.append(
-                ft.TextButton(
-                    text=truncated_name,
-                    style=ft.ButtonStyle(
-                        bgcolor=ft.Colors.BLUE if is_active else ft.Colors.TRANSPARENT,
-                        color=ft.Colors.WHITE if is_active else ft.Colors.BLACK,
-                    ),
-                    on_click=lambda e, cid=chat_id: self.switch_chat(cid),
-                )
-            )
-            
-        self.page.update()
-
-    def show_full_name_dialog(self, chat_id):
-        """
-        Muestra un cuadro de diálogo con el nombre completo del chat.
-        """
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Nombre completo."),
-            content=ft.ListView(
-                controls=[ft.Text(f"Nombre completo del chat:", size=16), 
-                          ft.Text(f"{chat_id}", size=16)],
-                height=100,  # Altura fija que permite el scroll si es necesario
-                width=300,
-            ),
-            actions=[
-                ft.TextButton("Cerrar", on_click=lambda e: self.close_dialog()),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
-
-    def rename_chat_dialog(self, chat_id):
-        """
-        Muestra un cuadro de diálogo para renombrar el chat seleccionado.
-        """
-        rename_input = ft.TextField(label="Nuevo nombre", expand=True)
-
-        def on_rename(e):
-            new_name = rename_input.value.strip()
-            if new_name and chat_id in self.chats:
-                self.rename_chat(chat_id, new_name)
-            self.close_dialog()
-
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Renombrar chat"),
-            content=rename_input,
-            actions=[
-                ft.TextButton("Cancelar", on_click=lambda e: self.close_dialog()),
-                ft.TextButton("Renombrar", on_click=on_rename),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
-
-    def delete_chat_dialog(self, chat_id):
-        """
-        Muestra un cuadro de diálogo para eliminar un chat seleccionado.
-        """
-        self.page.dialog = ft.AlertDialog(
-            modal=True,
-            title=ft.Text("Eliminar chat"),
-            content=ft.Text(f"¿Estás seguro de que deseas eliminar '{chat_id}'?"),
-            actions=[
-                ft.TextButton("Cancelar", on_click=lambda e: self.close_dialog()),
-                ft.TextButton(
-                    "Eliminar",
-                    on_click=lambda e, cid=chat_id: self.confirm_delete_chat(cid),
-                ),
-            ],
-        )
-        self.page.dialog.open = True
-        self.page.update()
-
-    def confirm_delete_chat(self, chat_id):
-        """
-        Confirma la eliminación del chat y cierra el cuadro de diálogo.
-        """
-        if chat_id in self.chats:
-            del self.chats[chat_id]
-            self.chat_order.remove(chat_id)
-        if chat_id == self.active_chat:
-            self.active_chat = next(iter(self.chat_order), None)
-            self.chat_title.value = self.chat_order[0]  # Actualizar el título del chat
-
-        self.update_chat_list()
-        self.load_messages()
-        self.close_dialog()
-
-    def rename_chat(self, old_name, new_name):
-        """
-        Renombra un chat existente.
-        """
-        self.chats[new_name] = self.chats.pop(old_name)
-        index = self.chat_order.index(old_name)
-        self.chat_order[index] = new_name  # Mantener el orden al renombrar
-        if self.active_chat == old_name:
-            self.active_chat = new_name
-            self.chat_title.value = new_name if len(new_name) <= 15 else f"{new_name[:12]}..."  # Actualizar el título del chat renombrado con truncamiento.
-        self.update_chat_list()
-        self.load_messages()
-
-    def load_messages(self):
-        """
-        Carga los mensajes del chat activo y los muestra en la UI.
-        """
-        self.messages_container.controls.clear()
-
-        if self.active_chat is None or self.active_chat not in self.chats:
-            self.show_welcome_message()
+    def _delete_chat_session(self, user_id: int):
+        sesiones = self.chat_service.get_user_sessions(user_id)
+        if not sesiones:
+            print("No hay sesiones para eliminar.")
             return
 
-        # Cargar mensajes del chat activo
-        for msg, is_user in self.chats[self.active_chat]:
-            alignment = (
-                ft.MainAxisAlignment.END if is_user else ft.MainAxisAlignment.START
-            )
-            color = "#2196F3" if is_user else "#4CAF50"
-            self.messages_container.controls.append(
-                ft.Row(
-                    controls=[
-                        ft.Container(
-                            content=ft.Text(msg, color="white", size=16),
-                            bgcolor=color,
-                            padding=10,
-                            margin=5,
-                            border_radius=5,
-                        )
-                    ],
-                    alignment=alignment,
-                )
-            )
+        print("Sesiones disponibles para eliminar:")
+        for idx, (sid, sname) in enumerate(sesiones, start=1):
+            print(f"{idx}. {sname} (ID: {sid})")
 
-        # Habilitar entrada de texto
-        self.user_input.disabled = False
-        self.send_button.disabled = False
-        self.page.update()
+        seleccion = input("Elige una sesión para eliminar: ").strip()
+        try:
+            seleccion = int(seleccion)
+            if 1 <= seleccion <= len(sesiones):
+                session_id = sesiones[seleccion-1][0]
+                if self.chat_service.delete_chat_session(session_id):
+                    print("Sesión eliminada correctamente.")
+                else:
+                    print("No se pudo eliminar la sesión.")
+            else:
+                print("Opción inválida.")
+        except ValueError:
+            print("Opción inválida.")
+        sesiones = self.chat_service.get_user_sessions(user_id)
+        if sesiones:
+            print("\nSesiones existentes:")
+            for idx, (sid, sname) in enumerate(sesiones, start=1):
+                print(f"{idx}. {sname} (ID: {sid})")
+            print(f"{len(sesiones)+1}. Crear nueva sesión")
 
-    def show_welcome_message(self):
-        """
-        Muestra el mensaje de bienvenida si no hay chats activos.
-        """
-        self.messages_container.controls.clear()
-        self.messages_container.controls.append(
-            ft.Container(
-                content=ft.Text(
-                    "MINDCARE\nBienvenido, haz clic en el botón + para comenzar.",
-                    size=16,
-                    color=ft.Colors.BLACK54,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-                alignment=ft.alignment.center,
-                expand=True,
-            )
+            seleccion = input("\nElige una opción: ").strip()
+            try:
+                seleccion = int(seleccion)
+                if 1 <= seleccion <= len(sesiones):
+                    return sesiones[seleccion-1][0]
+                else:
+                    sname = input("Nombre para la nueva sesión: ").strip()
+                    return self.chat_service.create_chat_session(user_id, sname or "Sesión Nueva")
+            except ValueError:
+                print("Opción inválida. Creando nueva sesión por defecto.")
+                return self.chat_service.create_chat_session(user_id, "Sesión Nueva")
+        else:
+            print("No tienes sesiones. Creando la primera sesión automáticamente.")
+            return self.chat_service.create_chat_session(user_id, "Sesión Inicial")
+
+    def _build_historial(self, session_id: int) -> list:
+        mensajes = self.chat_service.load_messages(session_id)
+        return [f"{'Usuario' if role == 'USER' else 'IA'}: {msg}" for role, msg in mensajes]
+
+    def _construct_prompt(self, historial: list) -> str:
+        """Construye el prompt para el modelo a partir del historial."""
+        contexto_base = (
+            "Eres un asistente amigable y versátil que responde de manera clara y precisa a todas las preguntas. "
+            "Para preguntas relacionadas con apoyo psicológico, responde empáticamente y adaptándote a las necesidades emocionales del usuario. "
+            "Para preguntas generales, proporciona información correcta y amigable. Habla exclusivamente en español. "
+            "Responde con claridad, evitando fragmentos incompletos o repeticiones innecesarias."
         )
-        self.user_input.disabled = True
-        self.send_button.disabled = True
-        self.page.update()
+        prompt = contexto_base
+        for mensaje in historial:
+            if mensaje.startswith("Usuario:"):
+                prompt += f"Usuario: {mensaje[8:].strip()}"
+            elif mensaje.startswith("IA:"):
+                prompt += f"IA: {mensaje[3:].strip()}"
+        prompt += "IA: "  # El modelo continuará desde este punto
+        return prompt
 
-    def send_message(self, e):
-        """
-        Envía un mensaje desde el usuario.
-        """
-        if not self.active_chat:
-            return
+    def _animacion_respuesta(self, stop_event: threading.Event):
+        animacion = "|/-\\"
+        while not stop_event.is_set():
+            for frame in animacion:
+                if stop_event.is_set():
+                    break
+                sys.stdout.write(f"\rEl chatbot está respondiendo {frame}")
+                sys.stdout.flush()
+                time.sleep(0.2)
 
-        user_text = self.user_input.value.strip()
-        if not user_text:
-            return
-
-        self.add_message(user_text, is_user=True)
-        self.user_input.value = ""
-        self.page.update()
-
-        # Simular respuesta del bot
-        self.bot_thread = threading.Thread(
-            target=self.simulate_bot_response, args=(user_text,)
-        )
-        self.bot_thread.start()
-
-    def simulate_bot_response(self, user_message):
-        """
-        Simula una respuesta del bot con un retraso.
-        """
-        self.typing_indicator.visible = True
-        self.page.update()
-
-        for _ in range(20):  # Simula un proceso largo con 2 segundos en total
-            if self.cancel_bot_response.is_set():
-                self.typing_indicator.visible = False
-                self.page.update()
-                return
-            time.sleep(0.1)
-
-        self.typing_indicator.visible = False
-        self.add_message(f"Bot: Respuesta a '{user_message}'", is_user=False)
-        self.page.update()
-
-    def add_message(self, text, is_user=True):
-        """
-        Agrega un mensaje a la conversación del chat activo.
-        """
-        alignment = (
-            ft.MainAxisAlignment.END if is_user else ft.MainAxisAlignment.START
-        )
-        color = "#2196F3" if is_user else "#4CAF50"
-
-        # Agregar el mensaje a la columna
-        self.messages_container.controls.append(
-            ft.Row(
-                controls=[
-                    ft.Container(
-                        content=ft.Text(text, color="white", size=16),
-                        bgcolor=color,
-                        padding=10,
-                        margin=5,
-                        border_radius=5,
-                    )
-                ],
-                alignment=alignment,
-            )
-        )
-
-        # Guardar el mensaje en el estado del chat activo
-        if self.active_chat:
-            self.chats[self.active_chat].append((text, is_user))
-
-
-def main(page: ft.Page):
-    app = ChatApp(page)
-    app.build_ui()
-
-
+# ======================== Ejecutar la aplicación ========================
 if __name__ == "__main__":
-    ft.app(target=main)
+    app = ChatApplication()
+    app.start()
