@@ -220,6 +220,29 @@ class ChatService:
         finally:
             cursor.close()
             conn.close()
+    
+    def get_session_by_id(self, session_id: int) -> tuple:
+        """Retorna una tupla con el ID de la sesión y su nombre dado el ID de la sesión."""
+        conn = self.db.get_connection()
+        if not conn:
+            return ()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, session_name 
+                FROM chat_sessions 
+                WHERE id = %s
+                """,
+                (session_id,)
+            )
+            return cursor.fetchone() or ()
+        except mysql.connector.Error as err:
+            print(f"Error al obtener la sesión: {err}")
+            return ()
+        finally:
+            cursor.close()
+            conn.close()
 
     def save_message(self, session_id: int, role: str, message: str) -> None:
         """Guarda un mensaje en la tabla 'messages'."""
@@ -237,7 +260,8 @@ class ChatService:
             )
             conn.commit()
         except mysql.connector.Error as err:
-            print(f"Error al guardar el mensaje: {err}")
+            #print(f"Error al guardar el mensaje: {err}")
+            print("")
         finally:
             cursor.close()
             conn.close()
@@ -349,6 +373,20 @@ class ChatApplication:
         self.auth_service = AuthService(self.db)
         self.chat_service = ChatService(self.db)
         self.chat_model = ChatModel()
+
+    def generar_respuesta(self, user_id: int, session_id: int, mensaje_usuario: str) -> str:
+        """Genera la respuesta del modelo dada una sesión de usuario y un mensaje."""
+        # Guardar el mensaje del usuario en la base de datos
+        self.chat_service.save_message(session_id, "USER", mensaje_usuario)
+        # Cargar el historial de la sesión
+        historial = self._build_historial(session_id)
+        # Construir el prompt
+        prompt = self._construct_prompt(historial)
+        # Generar la respuesta del modelo
+        respuesta_completa = self.chat_model.generate_response(prompt)
+        # Guardar la respuesta del modelo en la base de datos
+        self.chat_service.save_message(session_id, "ASSISTANT", respuesta_completa)
+        return respuesta_completa
 
     def start(self):
         print("\n=== Bienvenido a la aplicación de chat ===\n")
@@ -652,7 +690,8 @@ class ChatApplication:
             "Eres un asistente amigable y versátil que responde de manera clara y precisa a todas las preguntas. "
             "Para preguntas relacionadas con apoyo psicológico, responde empáticamente y adaptándote a las necesidades emocionales del usuario. "
             "Para preguntas generales, proporciona información correcta y amigable. Habla exclusivamente en español. "
-            "Responde con claridad, evitando fragmentos incompletos o repeticiones innecesarias."
+            "Responde con claridad evitando fragmentos incompletos o repeticiones innecesarias."
+            "RESPONDE solo con texto, es decir, sin  usar emojis."
         )
         prompt = contexto_base
         for mensaje in historial:
